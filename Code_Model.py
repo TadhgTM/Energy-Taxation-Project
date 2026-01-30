@@ -1,1156 +1,1055 @@
+from __future__ import annotations
 import numpy as np
 import pandas as pd
-from scipy.optimize import root, minimize
+from dataclasses import replace, dataclass
+from typing import Dict, Tuple, Optional
+from scipy.optimize import minimize, root
 import matplotlib.pyplot as plt
-# Our targets and parameters
+from multiprocessing import Pool, cpu_count
+from copy import deepcopy
 
-L_bar = 1.0
-GDP24 = 3.108551
-K24   = 7.8 # 7.8
-KY_target = K24 / GDP24     # =? 2.51
-K_bar = KY_target * L_bar
+"""
+DYNAMIC GENERAL EQUILIBRIUM MODEL WITH ENVIRONMENTAL EXTERNALITIES
 
-# Emissions intensities
-phi_j = np.array([1.0, 0.7741, 0.0])
-omega = 0.08
+This file contains a unified implementation of:
+1. general equilibrium model
+2. Dynamic Ramsey-Cass-Koopmans capital accumulation
+3. Optimal carbon tax policy over time
+4. Parallel computation for sensitivity analysis
 
-# Capital shares 
-a_j = np.array([0.86, 0.86, 0.90])
+STRUCTURE:
+- 3-sector CES energy aggregate (oil, gas, clean)
+- Cobb-Douglas final production with K, L, E
+- Capital accumulation: K_{t+1} = (1-δ)K_t + I_t
+- Euler equation for consumption smoothing
+- Terminal capital constraint
+- Parallel grid search for optimal policy
 
-# Base TFP guesses
-A_base = np.array([5.0, 5.0, 12.5])
+Notes:
+- Hardware tested on: Macbook Pro (M5, 24GB RAM, 2025)
+- Last updated: January 2026
 
-# Final good cobb douglas shares
-b_c = 0.6548
-e_c = 0.098
-a_c = 1 - b_c - e_c
+=============================================================================
+"""
 
-# Preferences
-tau = 0.00231  # initial tax guess
-gamma_hh = 2.0
-sigma = 0.5
-chi_hh = 1.0 # initial guess
+# ----------------------------
+# Constants
+# ----------------------------
 
-# Targets
-raw_energy_shares = np.array([0.524, 0.396, 0.080])
-TARGET_SHARES = raw_energy_shares / raw_energy_shares.sum()
+ENERGY_LABELS = ("oil", "gas", "clean")
+J = 3
+EPS = 1e-12
 
-EY_TARGET = 7.0
-L_TARGET  = 0.5 * L_bar
-Y_TARGET  = 1.0
-TARGET_PRICE = e_c / EY_TARGET
+# Global counter for equilibrium solves
+_SOLVE_COUNTER = 0
 
-# local solutions functions
 
-def softmax(z):
-    z = np.array(z)
-    ez = np.exp(z - np.max(z))
-    return ez / ez.sum()
+# ----------------------------
+# Static Model Components (from AGEMACRO.py)
+# ----------------------------
 
-def get_allocations(x, current_Ls):
-    sK = softmax(x[:4])
-    sL = softmax(x[4:8])
-    return sK*K_bar, sL*current_Ls
+def _clamp_pos(x, eps: float = 1e-12):
+    """Clamp to be strictly positive (works for scalars and arrays)"""
+    if np.isscalar(x):
+        return float(max(float(x), eps))
+    x = np.asarray(x, dtype=float)
+    return np.maximum(x, eps)
 
-# Production block - Energy and output. 
 
-def energy_outputs(K, L, gammas, A_scaler):
-    """E_j, dE/dK_j, dE/dL_j"""
-    A_eff = A_base * A_scaler
-    e  = np.zeros(3)
-    dK = np.zeros(3)
-    dL = np.zeros(3)
+@dataclass(frozen=True)
+class Params:
+    """Parameters for static equilibrium model"""
+    # Endowments
+    L_bar: float
+    K_bar: float
 
-    for j in range(3):
-        K_j = max(K[j], 1e-9)
-        L_j = max(L[j], 1e-9)
-        gamma = gammas[j]
+    # Final good technology (Cobb-Douglas)
+    A_final: float
+    a_c: float
+    b_c: float
+    e_c: float
 
-        base = A_eff[j] * (K_j**a_j[j]) * (L_j**(1 - a_j[j]))
-        e[j] = base**gamma
-
-        dK[j] = gamma * a_j[j] * e[j] / K_j
-        dL[j] = gamma * (1 - a_j[j]) * e[j] / L_j
-
-    return e, e.sum(), dK, dL
-
-def final_output(Kc, Lc, E, A_final):
-    Kc = max(Kc, 1e-9)
-    Lc = max(Lc, 1e-9)
-    E  = max(E , 1e-9)
-    return A_final * (Kc**a_c) * (Lc**b_c) * (E**e_c)
-
-# HH Block
-
-def household_values(w, r, L_s, e_vec, chi):
-    T = tau * np.dot(phi_j, e_vec)
-    income = w*L_s + r*K_bar + T
-    C = max(income, 1e-9)
-    Lrhs = w / (chi * max(C,1e-6)**gamma_hh)
-    Lrhs = min(Lrhs, 1e6)    
-    L_s_foc = max(Lrhs**(1.0/sigma), 1e-9)
-    return C, L_s_foc
-
-# Equalibrium System
-def ge_system(x, params):
-    A_energy = params[:3]
-    A_final  = params[3]
-    gammas   = params[4:7]
-    chi      = params[7]
-
-    r = np.exp(np.clip(x[8], -10, 10))
-    w = np.exp(np.clip(x[9], -10, 10))    
-    L_s = max(x[10], 0.01)
-
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
-
-    e_vec, E_total, dK_e, dL_e = energy_outputs(K_e, L_e, gammas, A_energy)
-    Y = final_output(K_c, L_c, E_total, A_final)
-
-    if E_total > 1e-9:
-        P_E = e_c * Y / E_total
-    else:
-        P_E = 10.0
-
-    C, L_s_foc = household_values(w, r, L_s, e_vec, chi)
-
-    F = np.zeros(11)
-
-    # Energy FOCs
-    for j in range(3):
-        p_net = P_E - tau * phi_j[j]
-        F[j]     = p_net*dK_e[j] - r
-        F[j + 3] = p_net*dL_e[j] - w
-
-    # Final good FOCs
-    F[6] = a_c*Y/max(K_c,1e-9) - r
-    F[7] = b_c*Y/max(L_c,1e-9) - w
-
-    # Household FOC
-    F[10] = L_s - L_s_foc
-
-    return F
-
-def set_tau(new_tau):
-    global tau
-    tau = new_tau
+    # Energy sector technologies
+    A_j: np.ndarray      # shape (3,)
+    a_j: np.ndarray      # capital share per energy sector
     
-def compute_welfare(sol, theta):
-    x = sol.x
-    L_s = max(x[10], 1e-9)
-    r   = np.exp(x[8])
-    w   = np.exp(x[9])
+    # Energy aggregator (CES)
+    eta: float           # elasticity of substitution
+    omega_E: np.ndarray  # CES weights, shape (3,)
 
-    # Unpack structural params
-    A_energy = theta[:3]
-    gammas   = theta[4:7]
-    chi      = theta[7]
+    # Emissions intensities
+    phi_j: np.ndarray    # shape (3,)
 
-    # Recover allocations
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
 
-    # Recompute energy outputs to get e_vec
-    e_vec, E_total, _, _ = energy_outputs(K_e, L_e, gammas, A_energy)
-    Z = np.dot(phi_j, e_vec)  # total emissions
+@dataclass(frozen=True)
+class Preferences:
+    """Household preferences"""
+    gamma_hh: float = 2.0  # CRRA in consumption
+    sigma: float = 0.5     # Frisch exponent
+    chi: float = 1.0       # scale on disutility
 
-    # C_with_rebate is current consumption including tax rebate
-    C_with_rebate, _ = household_values(w, r, L_s, e_vec, chi)
 
-    # Subtract damages from consumption
-    C_eff = C_with_rebate - omega * Z
-    C_eff = max(C_eff, 1e-9)
+@dataclass(frozen=True)
+class Policy:
+    """Government policy"""
+    tau: float = 0.0              # emissions tax rate
+    omega_damage: float = 0.08    # marginal damage weight
+    damage_type: str = "utility"  # "utility" or "productivity"
 
-    util = (C_eff**(1 - gamma_hh)) / (1 - gamma_hh) \
-           - chi * (L_s**(1 + sigma)) / (1 + sigma)
 
-    return float(util)
-
-def welfare_at_tax(tau_value, theta):
-    set_tau(tau_value)
-    sol = solve_ge(theta)
-    if not sol.success:
-        return -1e12  # penalize non-convergence
-    return compute_welfare(sol, theta)
-
-def welfare_grid(theta, tau_min=0, tau_max=200, n=80):
-    taus = np.linspace(tau_min, tau_max, n)
-    welfare_vals = []
-    for t in taus:
-        W = welfare_at_tax(t, theta)
-        welfare_vals.append(W)
-        print(f"tau={t:.2f}, Welfare={W:.6f}")
-    return taus, np.array(welfare_vals)
-
-def solve_ge(theta):
-    """Try LM first; if it fails, fall back to HYBR."""
-    x0 = np.zeros(11)
-    x0[8]  = np.log(0.2)
-    x0[9]  = np.log(2.0)
-    x0[10] = 0.3
-
-    params = theta
-    sol = root(ge_system, x0, args=(params,), method="lm", tol=1e-7)
-
-    if not sol.success:
-        sol = root(ge_system, x0, args=(params,), method="hybr", tol=1e-7)
-
-    return sol
-
-# Threaded calibration loss with jittered restart for new local loss solution.
-
-Nfeval = 1
-
-def calibration_loss(theta):
-    global Nfeval
-
-    A_energy = theta[:3]
-    A_final  = theta[3]
-    gammas   = theta[4:7]
-    chi      = theta[7]
-
-    sol = solve_ge(theta)
-    if not sol.success:
-        return 1e9
-
-    L_s = max(sol.x[10], 1e-9)
-    K_alloc, L_alloc = get_allocations(sol.x[:8], L_s)
-
-    e_vec, E_total, _, _ = energy_outputs(K_alloc[:3], L_alloc[:3], gammas, A_energy)
-    if E_total <= 1e-9:
-        return 1e9
-
-    Y = final_output(K_alloc[3], L_alloc[3], E_total, A_final)
-    if Y <= 1e-9:
-        return 1e9
-
-    model_shares = e_vec / E_total
-    price_model = e_c * Y / E_total
-    EY_model = E_total / Y
-    KY_model = K_bar / Y
-
-    share_err = np.sum((model_shares - TARGET_SHARES)**2)
-    price_err = (price_model - TARGET_PRICE)**2
-    L_err     = (L_s - L_TARGET)**2
-    Y_err     = (Y - Y_TARGET)**2
-    KY_err    = (KY_model - KY_target)**2
-    EY_err    = (EY_model - EY_TARGET)**2
-    reg_err = 0.1 * np.sum((gammas - 0.9)**2)
-
-    loss = ( #adjust weights as needed
-        25*share_err +
-        25*price_err +
-        150*L_err +
-        25*Y_err +
-        25*EY_err +
-        25*KY_err +
-        25*reg_err
-    )
-
-    if Nfeval % 50 == 0:
-        print(f"[{Nfeval}] Loss={loss:.4f}  Y={Y:.3f}  L={L_s:.3f}  P_E={price_model:.3f}")
-
-    Nfeval += 1
-    return loss
-
-def run_calibration_loop(start_theta=None):
-    global Nfeval
+@dataclass(frozen=True)
+class Equilibrium:
+    """Static equilibrium solution"""
+    success: bool
+    message: str
     
-    # Use the passed starting point if available, otherwise use the hardcoded guess
-    if start_theta is not None:
-        theta_best = np.array(start_theta)
-        print(">>> Starting calibration from previous best theta...")
-    else:
-        # Default starting guess
-        theta_best = np.array([
-            5.0, 5.0, 1.2,
-            3.0,
-            0.85, 0.83, 0.89,
-            1.5
-        ])
-
-    best_loss = 1e9
-    num_restarts = 1  # Reduce restarts for robustness speed
+    # prices (final numeraire pY=1)
+    w: float
+    r: float
+    pE: float
+    pj: np.ndarray
     
-    # Check if our starting point is already good enough
-    initial_loss = calibration_loss(theta_best)
-    if initial_loss < 0.01:
-        print(f"Initial theta is already good (Loss={initial_loss:.6f}). Skipping loop.")
-        return theta_best
-
-    bounds = [
-        (1, 10), (1, 10), (1, 5),
-        (0.5, 10.0),
-        (0.7, 1.0), (0.7, 1.0), (0.7, 1.0),
-        (0.1, 5.0)
-    ]
-
-    for attempt in range(1, num_restarts + 1):
-        if attempt == 1:
-            start = theta_best
-        else:
-            jitter = np.random.uniform(0.99, 1.01, size=len(theta_best)) # Smaller jitter
-            start = theta_best * jitter
-
-        res = minimize(
-            calibration_loss,
-            start,
-            method='L-BFGS-B',
-            bounds=bounds,
-            options={'maxiter': 2000, 'ftol': 1e-6} # Reduced tolerance for speed
-        )
-
-        loss = res.fun
-        if loss < best_loss:
-            best_loss = loss
-            theta_best = res.x
-
-    return theta_best
-
-# Reporting function
-
-def print_final_report(theta):
-    """
-    Print a structured calibration report and produce summary plots.
-    """
-    import matplotlib.pyplot as plt
-
-    # Unpack parameters
-    A_energy = theta[:3]
-    A_final  = theta[3]
-    gammas   = theta[4:7]
-    chi      = theta[7]
-
-    # Solve GE at a calibrated theta
-    sol = solve_ge(theta)
-    if not sol.success:
-        print("\nWARNING: GE solver did NOT CONVERGE at these parameters.")
-    x = sol.x
-
-    L_s = max(x[10], 1e-9)
-    r   = np.exp(x[8])
-    w   = np.exp(x[9])
-
     # allocations
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
-
-    # energy and final output
-    e_vec, E_total, dK_e, dL_e = energy_outputs(K_e, L_e, gammas, A_energy)
-    Y = final_output(K_c, L_c, E_total, A_final)
-    total_emissions = np.dot(phi_j, e_vec)
-    emissions_intensity = total_emissions / Y
-
-    # prices and household
-    P_E = e_c * Y / E_total
-
-    # compute household values WITH rebate
-    C_with_rebate, _ = household_values(w, r, L_s, e_vec, chi)
-
-    # Compute tax revenues
-    tax_revenue = tau * np.dot(phi_j, e_vec)
-
-    # Compute consumption WITHOUT tax rebate
-    C_no_rebate = w * L_s + r * K_bar
-
-
-    # key ratios
-    KY_model = K_bar / Y
-    EY_model = E_total / Y
-    model_shares = e_vec / E_total
-    energy_spend_share = (P_E * E_total) / Y   # should be close to e_c
-    # Run welfare grid around the calibrated parameters
+    L: float
+    Kc: float
+    Lc: float
+    Kj: np.ndarray
+    Lj: np.ndarray
     
-    # recompute objective for context
-    current_loss = calibration_loss(theta)
+    # quantities
+    Ej: np.ndarray
+    E: float
+    Y: float
+    C: float
     
-    # Compute taxes
-    tax_revenue = tau * np.dot(phi_j, e_vec)
+    # policy objects
+    Z: float
+    T_rev: float
+    
+    # welfare
+    W: float
+    
+    # residual norm
+    max_abs_resid: float
+    damage_factor: float = 1.0
 
-    # Consumption WITHOUT rebate
-    C_no_rebate = w * L_s + r * K_bar
 
-    # Consumption WITH rebate
-    C_with_rebate = C_no_rebate + tax_revenue
-    # Welfare at the calibrated baseline tau
+# ----------------------------
+# Production Functions
+# ----------------------------
 
-    # Continuous optimum BEFORE macro_data
-    obj = lambda t: -welfare_at_tax(t[0], theta)
-    taus = np.linspace(0.0, 0.05, 40)
-    Wvals = np.array([welfare_at_tax(t, theta_ec) for t in taus])
-    tau0 = taus[np.argmax(Wvals)]
+def energy_output(K: float, L: float, A: float, a: float) -> float:
+    """Energy sector output: E_j = A_j * K_j^{a_j} * L_j^{1-a_j}"""
+    K = _clamp_pos(K)
+    L = _clamp_pos(L)
+    A = _clamp_pos(A)
+    return float(A * (K ** a) * (L ** (1.0 - a)))
 
-    res = minimize(
-        lambda t: -welfare_at_tax(t[0], theta_ec),
-        x0=[tau0],
-        bounds=[(0.0, 0.05)]
-    )
-    tau_star = res.x[0]    
-    W_star = welfare_at_tax(tau_star_cont, theta)
 
-    # Macro Table
-    macro_data = [
-        ("Taxes collected T",      tax_revenue,    None),
-        ("Consumption (no rebate)", C_no_rebate,   None),
-        ("Consumption (with rebate)", C_with_rebate, None),
-        ("Output Y",            Y,          Y_TARGET),
-        ("Labour L_s",          L_s,        L_TARGET),
-        ("K/Y",                 KY_model,   KY_target),
-        ("E/Y",                 EY_model,   EY_TARGET),
-        ("Energy price P_E",    P_E,        TARGET_PRICE),
-        ("Energy spend share",  energy_spend_share, e_c),
-        ("Wage w",              w,          None),
-        ("Rental rate r",       r,          None),
-        ("Welfare at tau*",     W_star,              None),
-        ("Net Emissions", total_emissions, None),
-        ("Emissions intensity (per unit Y)", emissions_intensity, None),
-    ]
+def energy_marginal_products(K: float, L: float, A: float, a: float):
+    """Returns (E_j, dE/dK, dE/dL)"""
+    K = _clamp_pos(K, eps=1e-12)
+    L = _clamp_pos(L, eps=1e-12)
+    
+    Ej = energy_output(K, L, A, a)
+    dEdK = a * Ej / _clamp_pos(K, eps=1e-12)
+    dEdL = (1.0 - a) * Ej / _clamp_pos(L, eps=1e-12)
+    return float(Ej), float(dEdK), float(dEdL)
 
-    rows = []
-    for name, model_val, target_val in macro_data:
-        if target_val is None or target_val == 0:
-            abs_err = None
-            rel_err = None
-        else:
-            abs_err = model_val - target_val
-            rel_err = 100 * abs_err / target_val
-        rows.append({
-            "Variable":   name,
-            "Model":      model_val,
-            "Target":     target_val,
-            "Abs_Error":  abs_err,
-            "Rel_Error_%": rel_err
-        })
 
-    df_macro = pd.DataFrame(rows)
+def ces_quantity(E: np.ndarray, eta: float, omega: np.ndarray) -> float:
+    """CES energy aggregate: E = [sum omega_j * E_j^{(eta-1)/eta}]^{eta/(eta-1)}"""
+    E = np.asarray(E, dtype=float)
+    omega = np.asarray(omega, dtype=float)
+    assert E.shape == (J,) and omega.shape == (J,)
+    
+    E = _clamp_pos(E)
+    if abs(eta - 1.0) < 1e-10:
+        return float(np.exp(np.sum(omega * np.log(E))))
+    
+    rho = (eta - 1.0) / eta
+    inside = np.sum(omega * (E ** rho))
+    return float(inside ** (1.0 / rho))
 
-    # Energy share Table
-    share_rows = []
-    labels_energy = ["Oil", "Gas", "Clean"]
-    for j in range(3):
-        m = model_shares[j]
-        t = TARGET_SHARES[j]
-        abs_err = m - t
-        rel_err = 100 * abs_err / t if t != 0 else None
-        share_rows.append({
-            "Tech":        labels_energy[j],
-            "Model_Share": m,
-            "Target_Share": t,
-            "Abs_Error":   abs_err,
-            "Rel_Error_%": rel_err
-        })
-    df_shares = pd.DataFrame(share_rows)
 
-    # Sector Table
-    total_K = K_alloc.sum()
-    total_L = L_alloc.sum()
-    sector_labels = ["Oil", "Gas", "Clean", "Final"]
+def ces_price(p: np.ndarray, eta: float, omega: np.ndarray) -> float:
+    """Dual CES price index"""
+    p = np.asarray(p, dtype=float)
+    omega = np.asarray(omega, dtype=float)
+    assert p.shape == (J,) and omega.shape == (J,)
+    
+    p = _clamp_pos(p)
+    if abs(eta - 1.0) < 1e-10:
+        return float(np.exp(np.sum(omega * np.log(p))))
+    
+    inside = np.sum(omega * (p ** (1.0 - eta)))
+    return float(inside ** (1.0 / (1.0 - eta)))
 
-    sector_outputs = list(e_vec) + [Y]
-    sector_rows = []
-    for i in range(4):
-        K_i = K_alloc[i]
-        L_i = L_alloc[i]
-        Y_i = sector_outputs[i]
-        sector_rows.append({
-            "Sector":        sector_labels[i],
-            "K":             K_i,
-            "L":             L_i,
-            "Output":        Y_i,
-            "K_Share":       K_i / total_K,
-            "L_Share":       L_i / total_L
-        })
-    df_sector = pd.DataFrame(sector_rows)
 
-    # Paramater table
-    df_params = pd.DataFrame([
-        {"Parameter":"A_oil",        "Value":A_energy[0], "Type":"TFP (energy)"},
-        {"Parameter":"A_gas",        "Value":A_energy[1], "Type":"TFP (energy)"},
-        {"Parameter":"A_clean",      "Value":A_energy[2], "Type":"TFP (energy)"},
-        {"Parameter":"A_final",      "Value":A_final,     "Type":"TFP (final)"},
-        {"Parameter":"gamma_oil",    "Value":gammas[0],   "Type":"returns to scale"},
-        {"Parameter":"gamma_gas",    "Value":gammas[1],   "Type":"returns to scale"},
-        {"Parameter":"gamma_clean",  "Value":gammas[2],   "Type":"returns to scale"},
-        {"Parameter":"chi_hh",       "Value":chi,         "Type":"preference (labour disutility)"},
-        {"Parameter":"a_c",          "Value":a_c,         "Type":"capital share final"},
-        {"Parameter":"b_c",          "Value":b_c,         "Type":"labour share final"},
-        {"Parameter":"e_c",          "Value":e_c,         "Type":"energy share final"},
-        
+def final_output(K: float, L: float, E: float, A: float, a: float, b: float, e: float, damage_factor: float = 1.0) -> float:
+    """Final output: Y = A * damage_factor * K^a * L^b * E^e"""
+    K = float(_clamp_pos(K))
+    L = float(_clamp_pos(L))
+    E = float(_clamp_pos(E))
+    A = float(_clamp_pos(A))
+    damage_factor = float(np.clip(damage_factor, 0.01, 1.0))
+    return float(A * damage_factor * (K ** a) * (L ** b) * (E ** e))
+
+
+# ----------------------------
+# Utility and Emissions
+# ----------------------------
+
+def emissions(Ej: np.ndarray, phi_j: np.ndarray) -> float:
+    """Total emissions: Z = sum phi_j * E_j"""
+    Ej = np.asarray(Ej, dtype=float)
+    return float(np.dot(phi_j, Ej))
+
+
+def utility(C: float, L: float, Z: float, pref: Preferences, omega_damage: float) -> float:
+    """Utility: U(C,L) - omega_damage * Z"""
+    C = float(_clamp_pos(C))
+    L = float(_clamp_pos(L))
+    Z = float(max(Z, 0.0))
+    
+    g = pref.gamma_hh
+    s = pref.sigma
+    chi = pref.chi
+    
+    # CRRA
+    if abs(g - 1.0) < 1e-10:
+        uC = np.log(C)
+    else:
+        uC = (C ** (1.0 - g)) / (1.0 - g)
+    
+    uL = chi * (L ** (1.0 + s)) / (1.0 + s)
+    return float(uC - uL - omega_damage * Z)
+
+
+def household_budget(w: float, r: float, K_bar: float, L: float, T_lump: float) -> float:
+    """Budget constraint: C = wL + rK + T"""
+    return float(w * L + r * K_bar + T_lump)
+
+
+def household_labour_foc(w: float, C: float, pref: Preferences, L: float) -> float:
+    """Labour FOC residual: w - chi*C^gamma*L^sigma = 0"""
+    w = float(_clamp_pos(w))
+    C = float(_clamp_pos(C))
+    L = float(_clamp_pos(L))
+    return float(w - pref.chi * (C ** pref.gamma_hh) * (L ** pref.sigma))
+
+
+# ----------------------------
+# Equilibrium Solver
+# ----------------------------
+
+def _implied_component_prices_from_ces(Ej: np.ndarray, E: float, pE: float, eta: float, omega: np.ndarray) -> np.ndarray:
+    """Back out component prices from CES structure"""
+    Ej = np.asarray(Ej, dtype=float)
+    omega = np.asarray(omega, dtype=float)
+    Ej = _clamp_pos(Ej, eps=1e-12)
+    E = _clamp_pos(E, eps=1e-12)
+    Ej_over_E = _clamp_pos(Ej / E, eps=1e-12)
+    pj = pE * (omega ** (1.0 / eta)) * (Ej_over_E ** (-1.0 / eta))
+    return pj
+
+
+def residuals_static_ge(x: np.ndarray, P, pref: Preferences, pol: Policy) -> np.ndarray:
+    """12-equation system for static GE"""
+    x = np.asarray(x, dtype=float)
+    assert x.shape == (12,)
+    
+    # prices
+    w = float(np.exp(np.clip(x[0], -30, 30)))
+    r = float(np.exp(np.clip(x[1], -30, 30)))
+    pE = float(np.exp(np.clip(x[2], -30, 30)))
+    
+    # aggregate labour
+    L = float(_clamp_pos(x[3]))
+    
+    # allocations (logs)
+    K1, L1 = float(np.exp(np.clip(x[4], -30, 30))), float(np.exp(np.clip(x[5], -30, 30)))
+    K2, L2 = float(np.exp(np.clip(x[6], -30, 30))), float(np.exp(np.clip(x[7], -30, 30)))
+    K3, L3 = float(np.exp(np.clip(x[8], -30, 30))), float(np.exp(np.clip(x[9], -30, 30)))
+    Kc, Lc = float(np.exp(np.clip(x[10], -30, 30))), float(np.exp(np.clip(x[11], -30, 30)))
+    
+    Kj = np.array([K1, K2, K3], dtype=float)
+    Lj = np.array([L1, L2, L3], dtype=float)
+    
+    # energy sector outputs
+    Ej = np.zeros(J)
+    dEdK = np.zeros(J)
+    dEdL = np.zeros(J)
+    for j in range(J):
+        Ej[j], dEdK[j], dEdL[j] = energy_marginal_products(Kj[j], Lj[j], P.A_j[j], P.a_j[j])
+    
+    # energy aggregate
+    E = float(ces_quantity(Ej, P.eta, P.omega_E))
+    
+    # emissions and damages
+    Z_temp = emissions(Ej, P.phi_j)
+    damage_factor = 1.0  # Always use utility damages for now
+    
+    # final output
+    Y = float(final_output(Kc, Lc, E, P.A_final, P.a_c, P.b_c, P.e_c, damage_factor))
+    
+    # component prices and wedges
+    pj = _implied_component_prices_from_ces(Ej, E, pE, P.eta, P.omega_E)
+    net_pj = pj - pol.tau * P.phi_j
+    
+    # energy firm FOCs
+    eq_energy = np.zeros(6)
+    for j in range(J):
+        eq_energy[2*j] = net_pj[j] * dEdK[j] - r
+        eq_energy[2*j + 1] = net_pj[j] * dEdL[j] - w
+    
+    # final firm FOCs
+    eq_final_r = P.a_c * Y / _clamp_pos(Kc) - r
+    eq_final_w = P.b_c * Y / _clamp_pos(Lc) - w
+    eq_final_pE = P.e_c * Y / _clamp_pos(E) - pE
+    
+    # factor market clearing
+    eq_K = (Kc + Kj.sum()) - P.K_bar
+    eq_L = (Lc + Lj.sum()) - L
+    
+    # household labour FOC
+    Z = emissions(Ej, P.phi_j)
+    T_rev = pol.tau * Z
+    C = household_budget(w, r, P.K_bar, L, T_rev)
+    eq_hh = household_labour_foc(w, C, pref, L)
+    
+    return np.concatenate([
+        eq_energy,
+        np.array([eq_final_r, eq_final_w, eq_final_pE, eq_K, eq_L, eq_hh], dtype=float)
     ])
 
-    # prints report
-    pd.set_option("display.float_format", lambda v: f"{v: .4f}")
 
-    print("\n=================================================================")
-    print(" FINAL CALIBRATION REPORT")
-    print("=================================================================")
-    print(f"Calibration loss at theta: {current_loss:.6f}")
-    print("Solver success:", sol.success)
-
-    print("\n--- Calibrated Parameters ---")
-    print(df_params.to_string(index=False))
-
-    print("\n--- Macro Outcomes vs Targets ---")
-    print(df_macro.to_string(index=False))
-
-    print("\n--- Energy Shares (Model vs Target) ---")
-    print(df_shares.to_string(index=False))
-
-    print("\n--- Sectoral Allocations ---")
-    print(df_sector.to_string(index=False))
-
-    # PLOTS
-
-    # 1) Energy shares bar chart
-    plt.figure(figsize=(6,4))
-    x = np.arange(3)
-    width = 0.35
-    plt.bar(x - width/2, model_shares, width, label="Model")
-    plt.bar(x + width/2, TARGET_SHARES, width, label="Target")
-    plt.xticks(x, labels_energy)
-    plt.ylabel("Share of total energy")
-    plt.title("Energy Shares: Model vs Target")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    # 2) Macro fit vs targets
-    macro_names = ["L_s", "K/Y", "E/Y", "P_E", "Y"]
-    macro_model_vals  = [L_s, KY_model, EY_model, P_E, Y]
-    macro_target_vals = [L_TARGET, KY_target, EY_TARGET, TARGET_PRICE, Y_TARGET]
-
-    plt.figure(figsize=(7,4))
-    x2 = np.arange(len(macro_names))
-    width2 = 0.35
-    plt.bar(x2 - width2/2, macro_model_vals, width2, label="Model")
-    plt.bar(x2 + width2/2, macro_target_vals, width2, label="Target")
-    plt.xticks(x2, macro_names)
-    plt.title("Macro Targets: Model vs Data")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    # 3) Sectoral outputs
-    plt.figure(figsize=(6,4))
-    plt.bar(sector_labels, sector_outputs)
-    plt.ylabel("Output")
-    plt.title("Sectoral Outputs (Energy and Final Good)")
-    plt.tight_layout()
-    plt.show()
-    # 4) Welfare grid
-    print("\nComputing welfare grid...")
-    taus, Ws = welfare_grid(theta, tau_min=0.00221, tau_max=0.00241, n=50)
-    tau_star = taus[np.argmax(Ws)]
-    print(f"\nGrid-search optimal tau* =? {tau_star:.3f}")
-
-    #   welfare sensuety around tau
-    print("\nPlotting welfare sensitivity around tau* ...")
-
-    # Define a symmetric grid around tau*
-    span = 0.01      # 20% on either side
-    tau_low  = max(0.0, tau_star_cont * (1 - span))
-    tau_high = tau_star_cont * (1 + span)
-
-    # Build grid
-    taus = np.linspace(tau_low, tau_high, 10)
-    welfare_vals = []
-
-    for t in taus:
-        W = welfare_at_tax(t, theta)
-        welfare_vals.append(W)
-
-    welfare_vals = np.array(welfare_vals)
-
-    # Identify max on this local grid
-    idx_star = np.argmax(welfare_vals)
-    tau_star_grid = taus[idx_star]
-    W_star_grid = welfare_vals[idx_star]
-
-    # Plot
-    plt.figure(figsize=(8,5))
-    plt.plot(taus, welfare_vals, linewidth=3)
-    plt.scatter([tau_star_grid], [W_star_grid], color='black', s=60)
-
-    plt.axvline(tau_star_cont, linestyle='--', linewidth=2, label=f"Continuous optimum tau*={tau_star_cont:.5f}")
-
-    plt.title("Welfare Sensitivity Around Optimal Tax Rate", fontsize=14)
-    plt.xlabel("Energy Tax tau")
-    plt.ylabel("Welfare (Utility)")
-    plt.grid(True, alpha=0.4)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    print(f"\nLocal grid optimum tau =? {tau_star_grid:.6f}")
-    print(f"Continuous optimum tau* =? {tau_star_cont:.6f}")
-    print(f"Welfare difference W(tau_grid*) - W(tau*) = {W_star_grid - welfare_at_tax(tau_star_cont, theta):.6e}")
-
-    # Continuous optimum
-    print(f"\nContinuous optimum tau* = {tau_star_cont:.3f}")
-
-def simple_tax_grid(theta):
-    grid = np.linspace(0.0, 0.02, 50) 
+def solve_equilibrium(P, pref: Preferences, pol: Policy, x0: Optional[np.ndarray] = None) -> Equilibrium:
+    """Solve static general equilibrium"""
+    if x0 is None:
+        x0 = np.zeros(12)
+        x0[0] = np.log(2.0)    # w
+        x0[1] = np.log(0.2)    # r
+        x0[2] = np.log(0.02)   # pE
+        x0[3] = 0.5            # L (level)
+        x0[4:] = np.log(0.3)   # allocations
     
-    best_tau = 0.0
-    best_w = -1e12
+    def F(x):
+        return residuals_static_ge(x, P, pref, pol)
     
-    for t in grid:
-        w = welfare_at_tax(t, theta)
-        if w > best_w and w != -1e12:
-            best_w = w
-            best_tau = t
-            
-    # Stage 2: refine very closely around the winner
-    if best_tau > 0:
-        span = 0.002 # +/- 0.2%
-        fine_grid = np.linspace(max(0, best_tau - span), best_tau + span, 40)
-        for t in fine_grid:
-            w = welfare_at_tax(t, theta)
-            if w > best_w:
-                best_w = w
-                best_tau = t
-                
-    return best_tau, best_w
+    sol = root(F, x0, method="hybr", tol=1e-10)
+    x = np.asarray(sol.x, dtype=float)
+    
+    w = float(np.exp(np.clip(x[0], -30, 30)))
+    r = float(np.exp(np.clip(x[1], -30, 30)))
+    pE = float(np.exp(np.clip(x[2], -30, 30)))
+    L = float(_clamp_pos(x[3]))
+    
+    Kj = np.array([np.exp(x[4]), np.exp(x[6]), np.exp(x[8])], dtype=float)
+    Lj = np.array([np.exp(x[5]), np.exp(x[7]), np.exp(x[9])], dtype=float)
+    Kc = float(np.exp(x[10]))
+    Lc = float(np.exp(x[11]))
+    
+    Ej = np.zeros(J)
+    for j in range(J):
+        Ej[j] = energy_output(Kj[j], Lj[j], P.A_j[j], P.a_j[j])
+    
+    E = float(ces_quantity(Ej, P.eta, P.omega_E))
+    Y = float(final_output(Kc, Lc, E, P.A_final, P.a_c, P.b_c, P.e_c))
+    
+    Z = emissions(Ej, P.phi_j)
+    T_rev = pol.tau * Z
+    C = household_budget(w, r, P.K_bar, L, T_rev)
+    
+    pj = _implied_component_prices_from_ces(Ej, E, pE, P.eta, P.omega_E)
+    W = utility(C, L, Z, pref, pol.omega_damage)
+    
+    resid = F(x)
+    max_abs = float(np.max(np.abs(resid)))
+    
+    return Equilibrium(
+        success=bool(sol.success),
+        message=str(sol.message),
+        w=w, r=r, pE=pE, pj=pj,
+        L=L, Kc=Kc, Lc=Lc, Kj=Kj, Lj=Lj,
+        Ej=Ej, E=E, Y=Y, C=C,
+        Z=Z, T_rev=T_rev,
+        W=W,
+        max_abs_resid=max_abs
+    )
 
-def get_full_macro_state(theta, tau_val, scenario_name, param_val):
-    """
-    Solves the model at a specific tax and returns a dictionary of ALL variables.
-    """
-    # Set the tax and solve
-    set_tau(tau_val)
-    sol = solve_ge(theta)
-    
-    if not sol.success:
-        return None # Skip failed runs
 
-    # Extract Basic Variables
-    x = sol.x
-    r   = np.exp(x[8])
-    w   = np.exp(x[9])
-    L_s = max(x[10], 1e-9)
-    
-    # Allocations
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
+# ----------------------------
+# Dynamic Model Components
+# ----------------------------
 
-    # Production & Energy
-    A_energy = theta[:3]
-    gammas   = theta[4:7]
-    A_final  = theta[3]
-    chi_val  = theta[7]
+@dataclass
+class DynamicParams:
+    """Parameters for dynamic model"""
+    beta: float = 0.96     # discount factor
+    delta: float = 0.08    # depreciation rate
+    T: int = 10            # time horizon
+    K_terminal: float = 2.51  # terminal capital target
+    
+    def validate(self) -> None:
+        assert 0 < self.beta < 1, "beta must be in (0,1)"
+        assert 0 < self.delta < 1, "delta must be in (0,1)"
+        assert self.T > 0, "T must be positive"
+        assert self.K_terminal > 0, "K_terminal must be positive"
 
-    e_vec, E_total, _, _ = energy_outputs(K_e, L_e, gammas, A_energy)
-    Y = final_output(K_c, L_c, E_total, A_final)
-    
-    # Emissions
-    Z = np.dot(phi_j, e_vec)  # Total emissions
-    
-        # Consumption & Government
-    # Tax Revenue = tau * Emissions (since tax is on emissions intensity phi * e)
-    Tax_Rev = tau_val * Z
-    
-    # Household Income = wL + rK + T
-    Income = w * L_s + r * K_bar + Tax_Rev
-    C = Income # Market clearing C = Income
-    
-    # Prices
-    if E_total > 1e-9:
-        P_E = e_c * Y / E_total # Energy price from FOC
-    else:
-        P_E = 0.0
 
+@dataclass(frozen=True)
+class DynamicEquilibrium:
+    """Complete dynamic equilibrium path"""
+    success: bool
+    message: str
+    
+    # Paths (length T)
+    K_vec: np.ndarray
+    C_vec: np.ndarray
+    Y_vec: np.ndarray
+    E_vec: np.ndarray
+    Z_vec: np.ndarray
+    I_vec: np.ndarray
+    
     # Welfare
-    # Recalculate utility with the specific damage parameter (global omega)
-    C_eff = max(C - omega * Z, 1e-9)
-    Util  = (C_eff**(1 - gamma_hh)) / (1 - gamma_hh) - chi_val * (L_s**(1 + sigma)) / (1 + sigma)
+    W_present_value: float
+    
+    # Policy
+    tau: float
+    omega_damage: float
 
-    # Return EVERYTHING in a dictionary
-    return {
-        "Scenario": scenario_name,
-        "Param_Value": param_val,
-        "Opt_Tax_Rate_%": tau_val * 100,
-        
-        # Macro Aggregates
-        "Output_Y": Y,
-        "Consumption_C": C,
-        "Labour_L": L_s,
-        "Energy_E": E_total,
-        "Emissions_Z": Z,
-        "Tax_Revenue": Tax_Rev,
-        
-        # Prices
-        "Wage_w": w,
-        "Rental_r": r,
-        "Energy_Price_P_E": P_E,
-        
-        # Ratios
-        "E_over_Y": E_total / Y if Y > 0 else 0,
-        "K_over_Y": K_bar / Y if Y > 0 else 0,
-        "C_over_Y": C / Y if Y > 0 else 0,
-        "TaxRev_over_Y_%": (Tax_Rev / Y)*100 if Y > 0 else 0,
-        "Emissions_Intensity_Z_Y": Z / Y if Y > 0 else 0,
-        
-        # Welfare
-        "Welfare_Util": Util,
-        
-        # Sectoral Shares (Energy Mix)
-        "Oil_Share_%": (e_vec[0]/E_total)*100 if E_total > 0 else 0,
-        "Gas_Share_%": (e_vec[1]/E_total)*100 if E_total > 0 else 0,
-        "Clean_Share_%": (e_vec[2]/E_total)*100 if E_total > 0 else 0,
-    }
 
-def get_baseline_equilibrium(theta):
-    sol = solve_ge(theta)
-    if not sol.success:
+# ----------------------------
+# Dynamic Equilibrium Solver
+# ----------------------------
+
+def solve_dynamic_equilibrium_simple(
+    K0: float,
+    dyn_params: DynamicParams,
+    static_params: Dict,
+    policy_params: Dict,
+    verbose: bool = False
+) -> Optional[DynamicEquilibrium]:
+    """
+    Solve dynamic equilibrium with FULL energy structure from static model.
+    
+    Uses root finding to satisfy terminal capital constraint.
+    """
+    T = dyn_params.T
+    beta = dyn_params.beta
+    delta = dyn_params.delta
+    K_terminal = dyn_params.K_terminal
+    
+    tau = policy_params['tau']
+    omega = policy_params['omega_damage']
+    
+    # Build static model objects
+    P_base = Params(
+        L_bar=static_params['L_bar'],
+        K_bar=K0,  # Will be updated each period
+        A_final=static_params['A_final'],
+        a_c=static_params['a_c'],
+        b_c=static_params['b_c'],
+        e_c=static_params['e_c'],
+        A_j=np.array(static_params['A_j']),
+        a_j=np.array(static_params['a_j']),
+        eta=static_params['eta'],
+        omega_E=np.array(static_params['omega_E']),
+        phi_j=np.array(static_params['phi_j'])
+    )
+    
+    pref = Preferences(
+        gamma_hh=static_params['gamma'],
+        sigma=static_params['sigma'],
+        chi=static_params['chi']
+    )
+    
+    def simulate_path_full(C0: float):
+        """Simulate full path given C0, return terminal error"""
+        global _SOLVE_COUNTER
+        
+        C_path = np.zeros(T)
+        K_path = np.zeros(T + 1)
+        equilibria = []
+        
+        K_path[0] = K0
+        C_path[0] = C0
+        
+        for t in range(T):
+            K_t = K_path[t]
+            C_t = C_path[t]
+            
+            # Update capital endowment for period t
+            P_t = replace(P_base, K_bar=K_t)
+            
+            # Policy for this period
+            pol_t = Policy(tau=tau, omega_damage=omega, damage_type="utility")
+            
+            # Solve static equilibrium for period t
+            try:
+                _SOLVE_COUNTER += 1
+                eq_t = solve_equilibrium(P_t, pref, pol_t)
+                if not eq_t.success or eq_t.max_abs_resid > 1e-6:
+                    if verbose:
+                        print(f"Period {t}: Failed to solve equilibrium")
+                    return C_path, K_path, equilibria, 1e9
+            except Exception as e:
+                if verbose:
+                    print(f"Period {t}: Exception: {e}")
+                return C_path, K_path, equilibria, 1e9
+            
+            equilibria.append(eq_t)
+            
+            # Extract period t outcomes
+            Y_t = eq_t.Y
+            
+            # Investment (residual from resource constraint)
+            I_t = Y_t - C_t
+            if I_t < -1e-6:
+                if verbose:
+                    print(f"Period {t}: Negative investment I={I_t:.6f}")
+                return C_path, K_path, equilibria, 1e9
+            
+            I_t = max(I_t, 0.0)
+            
+            # Capital accumulation
+            K_path[t + 1] = (1 - delta) * K_t + I_t
+            
+            # Euler equation for next period's consumption (if t < T-1)
+            if t < T - 1:
+                K_next = K_path[t + 1]
+                P_next = replace(P_base, K_bar=K_next)
+                
+                # Iterate to find consistent C_{t+1}
+                C_next_guess = C_t
+                
+                for _ in range(5):  # Euler iterations
+                    try:
+                        _SOLVE_COUNTER += 1
+                        eq_next = solve_equilibrium(P_next, pref, pol_t)
+                        if eq_next.success:
+                            r_next = eq_next.r
+                            Y_next = eq_next.Y
+                            
+                            # Euler equation
+                            gamma = pref.gamma_hh
+                            growth_factor = (beta * (1 - delta + r_next)) ** (1.0 / gamma)
+                            C_next_new = C_t * growth_factor
+                            
+                            # Make sure it's feasible
+                            C_next_new = min(C_next_new, 0.95 * Y_next)
+                            
+                            if abs(C_next_new - C_next_guess) < 1e-5:
+                                C_path[t + 1] = C_next_new
+                                break
+                            C_next_guess = 0.5 * C_next_guess + 0.5 * C_next_new
+                        else:
+                            C_path[t + 1] = C_t * 1.02
+                            break
+                    except:
+                        C_path[t + 1] = C_t * 1.02
+                        break
+                else:
+                    C_path[t + 1] = C_next_guess
+        
+        terminal_error = K_path[T] - K_terminal
+        return C_path, K_path, equilibria, terminal_error
+    
+    # Root finding for C_0
+    def objective(C0_log):
+        C0 = np.exp(C0_log)
+        _, _, _, term_err = simulate_path_full(C0)
+        return term_err
+    
+    # Initial guess
+    global _SOLVE_COUNTER
+    P_0 = replace(P_base, K_bar=K0)
+    pol_0 = Policy(tau=tau, omega_damage=omega, damage_type="utility")
+    try:
+        _SOLVE_COUNTER += 1
+        eq_0 = solve_equilibrium(P_0, pref, pol_0)
+        if eq_0.success:
+            Y_approx = eq_0.Y
+            I_ss = delta * K0
+            C0_guess = max(Y_approx - I_ss, 0.1)
+            C_lower = 0.01
+            C_upper = 0.95 * Y_approx
+        else:
+            C0_guess = 0.3
+            C_lower = 0.01
+            C_upper = 0.8
+    except:
+        C0_guess = 0.3
+        C_lower = 0.01
+        C_upper = 0.8
+    
+    from scipy.optimize import brentq
+    try:
+        C0_log_opt = brentq(objective, np.log(C_lower), np.log(C_upper),
+                           xtol=1e-6, maxiter=100)
+        C0_opt = np.exp(C0_log_opt)
+        success = True
+        message = "Dynamic equilibrium solved"
+    except Exception as e:
+        if verbose:
+            print(f"Root finding failed: {e}")
         return None
-
-    x = sol.x
-    L_s = max(x[10], 1e-9)
-    r   = np.exp(x[8])
-    w   = np.exp(x[9])
-
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
-
-    e_vec, E_total, _, _ = energy_outputs(
-        K_e, L_e,
-        theta[4:7],
-        theta[:3]
+    
+    # Simulate final path
+    C_path, K_path, equilibria, term_err = simulate_path_full(C0_opt)
+    
+    if abs(term_err) > 1e-3:
+        if verbose:
+            print(f"Terminal error too large: {term_err}")
+        return None
+    
+    # Extract paths
+    Y_vec = np.array([eq.Y for eq in equilibria])
+    E_vec = np.array([eq.E for eq in equilibria])
+    Z_vec = np.array([eq.Z for eq in equilibria])
+    I_vec = Y_vec - C_path
+    
+    # Welfare (present value)
+    W_terms = np.array([utility(C_path[t], equilibria[t].L, Z_vec[t], pref, omega) 
+                       for t in range(T)])
+    discounts = np.array([beta**t for t in range(T)])
+    W_PV = float(np.sum(discounts * W_terms))
+    
+    return DynamicEquilibrium(
+        success=True,
+        message=message,
+        K_vec=K_path[:T],
+        C_vec=C_path,
+        Y_vec=Y_vec,
+        E_vec=E_vec,
+        Z_vec=Z_vec,
+        I_vec=I_vec,
+        W_present_value=W_PV,
+        tau=tau,
+        omega_damage=omega
     )
 
-    Y = final_output(K_c, L_c, E_total, theta[3])
-    Z = np.dot(phi_j, e_vec)
-    P_E = e_c * Y / E_total if E_total > 0 else np.nan
-    tax_rev = tau * Z
 
+# ----------------------------
+# Parallel Helper Functions
+# ----------------------------
+
+def _evaluate_tau_parallel(args):
+    """Helper for parallel grid search"""
+    tau, K0, dyn_params, static_params, omega_damage = args
+    policy_params = {'tau': float(tau), 'omega_damage': float(omega_damage)}
+    try:
+        eq = solve_dynamic_equilibrium_simple(K0, dyn_params, static_params, policy_params, verbose=False)
+        if eq.success:
+            return (tau, eq.W_present_value)
+    except:
+        pass
+    return None
+
+
+def _solve_omega_parallel(args):
+    """Helper for parallel omega sensitivity"""
+    om, K0, dyn_params, static_params, tau_bounds, grid_n = args
+    opt = find_optimal_tau_dynamic(K0, dyn_params, static_params, float(om),
+                                   tau_bounds=tau_bounds, grid_n=grid_n, parallel=False)
+    
+    if opt['success']:
+        eq = opt['equilibrium']
+        row = summarize_dynamic_eq(eq, opt['tau_star'], float(om), 'omega', float(om))
+        row['at_bound'] = opt['at_lower_bound'] or opt['at_upper_bound']
+        status = "HIT UPPER BOUND!" if opt['at_upper_bound'] else (
+                "HIT LOWER BOUND!" if opt['at_lower_bound'] else f"W = {opt['W_star']:.4f}")
+        return (om, opt['tau_star'], status, row)
+    else:
+        row = summarize_dynamic_eq(None, np.nan, float(om), 'omega', float(om))
+        row['at_bound'] = False
+        return (om, np.nan, "FAILED", row)
+
+
+def _solve_ec_parallel(args):
+    """Helper for parallel energy share sensitivity"""
+    ec, K0, dyn_params, base_static_params, omega_damage, tau_bounds, grid_n = args
+    
+    # Adjust shares
+    b_c = base_static_params['b_c']
+    new_a_c = 1.0 - b_c - ec
+    
+    if new_a_c <= 0:
+        return (ec, np.nan, "INVALID (a_c <= 0)", None, new_a_c)
+    
+    # Update parameters
+    static_params = base_static_params.copy()
+    static_params['a_c'] = new_a_c
+    static_params['e_c'] = ec
+    
+    opt = find_optimal_tau_dynamic(K0, dyn_params, static_params, omega_damage,
+                                   tau_bounds=tau_bounds, grid_n=grid_n, parallel=False)
+    
+    if opt['success']:
+        eq = opt['equilibrium']
+        row = summarize_dynamic_eq(eq, opt['tau_star'], omega_damage, 'e_c', float(ec))
+        row['at_bound'] = opt['at_lower_bound'] or opt['at_upper_bound']
+        row['a_c'] = new_a_c
+        status = "HIT UPPER BOUND!" if opt['at_upper_bound'] else (
+                "HIT LOWER BOUND!" if opt['at_lower_bound'] else f"W = {opt['W_star']:.4f}")
+        return (ec, opt['tau_star'], status, row, new_a_c)
+    else:
+        row = summarize_dynamic_eq(None, np.nan, omega_damage, 'e_c', float(ec))
+        row['at_bound'] = False
+        row['a_c'] = new_a_c
+        return (ec, np.nan, "FAILED", row, new_a_c)
+
+
+# ----------------------------
+# Optimal Tax Finding
+# ----------------------------
+
+def find_optimal_tau_dynamic(
+    K0: float,
+    dyn_params: DynamicParams,
+    static_params: Dict,
+    omega_damage: float,
+    tau_bounds: Tuple[float, float] = (0.0, 0.30),
+    grid_n: int = 21,
+    parallel: bool = False
+) -> Dict:
+    """Find optimal carbon tax that maximizes welfare"""
+    tau_lo, tau_hi = tau_bounds
+    grid = np.linspace(tau_lo, tau_hi, grid_n)
+    
+    # Grid search (parallel or serial)
+    args_list = [(tau, K0, dyn_params, static_params, omega_damage) for tau in grid]
+    
+    if parallel:
+        n_cores = min(cpu_count(), len(grid))
+        with Pool(n_cores) as pool:
+            results = pool.map(_evaluate_tau_parallel, args_list)
+    else:
+        results = [_evaluate_tau_parallel(args) for args in args_list]
+    
+    feasible = [r for r in results if r is not None]
+    
+    if len(feasible) == 0:
+        return {
+            'tau_star': np.nan,
+            'W_star': -1e12,
+            'success': False,
+            'at_lower_bound': False,
+            'at_upper_bound': False,
+        }
+    
+    # Find best from grid
+    tau0, W0 = max(feasible, key=lambda x: x[1])
+    
+    # Local refinement
+    def objective(tau_arr):
+        tau = float(tau_arr[0])
+        policy_params = {'tau': tau, 'omega_damage': float(omega_damage)}
+        try:
+            eq = solve_dynamic_equilibrium_simple(K0, dyn_params, static_params, policy_params, verbose=False)
+            if not eq.success:
+                return 1e9
+            return -eq.W_present_value
+        except:
+            return 1e9
+    
+    res = minimize(objective, x0=np.array([tau0]), bounds=[tau_bounds], method='L-BFGS-B', options={'ftol': 1e-8})
+    tau_star = float(res.x[0])
+    
+    # Verify solution
+    policy_params = {'tau': tau_star, 'omega_damage': float(omega_damage)}
+    eq_star = solve_dynamic_equilibrium_simple(K0, dyn_params, static_params, policy_params, verbose=False)
+    
+    # Check boundary
+    at_lower = abs(tau_star - tau_lo) < 1e-4
+    at_upper = abs(tau_star - tau_hi) < 1e-4
+    
     return {
-        "omega": omega,
-        "e_c": e_c,
-        "tax": tau * 100,
-        "Y": Y,
-        "L": L_s,
-        "E": E_total,
-        "Emissions": Z,
-        "Energy_Price": P_E,
-        "Tax_Revenue": tax_rev
+        'tau_star': tau_star,
+        'W_star': eq_star.W_present_value if eq_star else -1e12,
+        'success': eq_star is not None and eq_star.success,
+        'equilibrium': eq_star,
+        'at_lower_bound': at_lower,
+        'at_upper_bound': at_upper
     }
 
-def run_robustness_analysis(baseline_theta):
-    global omega, e_c
 
-    base_omega = omega
-    base_e_c   = e_c
+# ----------------------------
+# Sensitivity Analysis
+# ----------------------------
 
-    omega_range = np.array([0.5, 1.0, 1.5, 2.0, 5.0]) * base_omega
-    ec_range    = np.linspace(0.03, 0.15, 25)
-
-    omega_rows = []
-    ec_rows    = []
-
-    # baseline equilibrium
-    baseline_row = get_baseline_equilibrium(baseline_theta)
-
-    # omega robustness
-    for val in omega_range:
-        omega = val
-        e_c   = base_e_c
-
-        tau_star, _ = simple_tax_grid(baseline_theta)
-        set_tau(tau_star)
-        sol = solve_ge(baseline_theta)
-
-        if not sol.success:
-            continue
-
-        x = sol.x
-        L_s = max(x[10], 1e-9)
-        K_alloc, L_alloc = get_allocations(x[:8], L_s)
-
-        e_vec, E_total, _, _ = energy_outputs(
-            K_alloc[:3], L_alloc[:3],
-            baseline_theta[4:7],
-            baseline_theta[:3]
-        )
-
-        Y = final_output(
-            K_alloc[3], L_alloc[3],
-            E_total,
-            baseline_theta[3]
-        )
-
-        omega_rows.append({
-            "omega": val,
-            "tax": tau_star * 100,
-            "Y": Y
-        })
-
-    # energy share robustness
-    for val in ec_range:
-        e_c   = val
-        omega = base_omega
-
-        tau_star, _ = simple_tax_grid(baseline_theta)
-        set_tau(tau_star)
-        sol = solve_ge(baseline_theta)
-
-        if not sol.success:
-            continue
-
-        x = sol.x
-        L_s = max(x[10], 1e-9)
-        K_alloc, L_alloc = get_allocations(x[:8], L_s)
-
-        e_vec, E_total, _, _ = energy_outputs(
-            K_alloc[:3], L_alloc[:3],
-            baseline_theta[4:7],
-            baseline_theta[:3]
-        )
-
-        Y = final_output(
-            K_alloc[3], L_alloc[3],
-            E_total,
-            baseline_theta[3]
-        )
-
-        ec_rows.append({
-            "e_c": val,
-            "tax": tau_star * 100,
-            "Y": Y
-        })
-
-    omega = base_omega
-    e_c   = base_e_c
-
-    df_baseline = pd.DataFrame([baseline_row])
-    df_omega    = pd.DataFrame(omega_rows)
-    df_ec       = pd.DataFrame(ec_rows)
-
-    return df_baseline, df_omega, df_ec
-
-# ROBUSTNESS MODULE
-
-def welfare_at_tax_with_damage(tau_value, theta, omega):
-    """
-    Welfare with damage.
-    """
-    set_tau(tau_value)
-    sol = solve_ge(theta)
-    if not sol.success:
-        return -1e12
-
-    x = sol.x
-    L_s = max(x[10], 1e-9)
-    r   = np.exp(x[8])
-    w   = np.exp(x[9])
-
-    # allocations
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
-
-    # energy
-    e_vec, E_total, _, _ = energy_outputs(K_e, L_e, theta[4:7], theta[:3])
-    Z = np.dot(phi_j, e_vec)
-
-    # household utility (with rebate)
-    C, _ = household_values(w, r, L_s, e_vec, theta[7])
-
-    utility = (C**(1 - gamma_hh)) / (1 - gamma_hh) \
-              - theta[7] * (L_s**(1 + sigma)) / (1 + sigma) \
-              - omega * Z
-
-    return float(utility)
+def summarize_dynamic_eq(eq: Optional[DynamicEquilibrium], tau: float, omega: float, 
+                        param_type: str, param_value: float) -> Dict:
+    """Summarize dynamic equilibrium for table output"""
+    if eq is None:
+        return {
+            'Param': param_value,
+            'tau': tau,
+            'W_PV': np.nan,
+            'Y_avg': np.nan,
+            'C_avg': np.nan,
+            'E_avg': np.nan,
+            'Z_total': np.nan,
+            'K_final': np.nan,
+            'inv_rate_avg': np.nan,
+            'success': False
+        }
+    
+    Y_avg = float(np.mean(eq.Y_vec))
+    C_avg = float(np.mean(eq.C_vec))
+    E_avg = float(np.mean(eq.E_vec))
+    Z_total = float(np.sum(eq.Z_vec))
+    K_final = float(eq.K_vec[-1]) if len(eq.K_vec) > 0 else np.nan
+    inv_rate = eq.I_vec / np.clip(eq.Y_vec, 1e-10, None)
+    inv_rate_avg = float(np.mean(inv_rate))
+    
+    return {
+        'Param': param_value,
+        'tau': tau,
+        'W_PV': eq.W_present_value,
+        'Y_avg': Y_avg,
+        'C_avg': C_avg,
+        'E_avg': E_avg,
+        'Z_total': Z_total,
+        'K_final': K_final,
+        'inv_rate_avg': inv_rate_avg,
+        'success': eq.success
+    }
 
 
-def optimal_tau_for_omega(theta, omega,
-                          tau_bounds=(0.0, 0.05),
-                          grid_n=40):
-    """
-    Finds tau* for a given omega using grid + local refinement.
-    """
-    taus = np.linspace(tau_bounds[0], tau_bounds[1], grid_n)
-    Wvals = np.array([
-        welfare_at_tax_with_damage(t, theta, omega) for t in taus
-    ])
-
-    tau0 = taus[np.argmax(Wvals)]
-
-    obj = lambda t: -welfare_at_tax_with_damage(t[0], theta, omega)
-
-    res = minimize(obj, x0=[tau0], bounds=[tau_bounds], tol=1e-8)
-    return res.x[0], -res.fun
-
-
-def run_omega_robustness(theta):
-    omega_grid = [0.04, 0.08, 0.12, 0.16, 0.40]
+def omega_sensitivity_dynamic(
+    K0: float,
+    dyn_params: DynamicParams,
+    static_params: Dict,
+    omega_grid: np.ndarray,
+    tau_bounds: Tuple[float, float] = (0.0, 0.30),
+    grid_n: int = 21
+) -> pd.DataFrame:
+    """Run sensitivity analysis over omega_damage parameter"""
+    print("\n" + "="*70)
+    print("PANEL A: OMEGA SENSITIVITY (DYNAMIC MODEL)")
+    print("="*70)
+    
+    n_cores = min(cpu_count(), len(omega_grid))
+    print(f"\nUsing {n_cores} CPU cores for parallel computation...")
+    
+    args_list = [(om, K0, dyn_params, static_params, tau_bounds, grid_n) 
+                 for om in omega_grid]
+    
+    with Pool(n_cores) as pool:
+        results = pool.map(_solve_omega_parallel, args_list)
+    
+    # Build DataFrame
     rows = []
-
-    for omega in omega_grid:
-        tau_star, W_star = optimal_tau_for_omega(theta, omega)
-        set_tau(tau_star)
-        sol = solve_ge(theta)
-
-        if not sol.success:
-            continue
-
-        x = sol.x
-        L_s = x[10]
-        K_alloc, L_alloc = get_allocations(x[:8], L_s)
-        e_vec, E, _, _ = energy_outputs(
-            K_alloc[:3], L_alloc[:3], theta[4:7], theta[:3]
-        )
-        Y = final_output(K_alloc[3], L_alloc[3], E, theta[3])
-        Z = np.dot(phi_j, e_vec)
-
-        rows.append({
-            "omega": omega,
-            "tau_star": tau_star,
-            "Y": Y,
-            "E": E,
-            "Z": Z,
-            "W": W_star
-        })
-
-    return pd.DataFrame(rows)
+    for om, tau_star, status, row in results:
+        print(f"\nω = {om:.3f}: τ* = {tau_star:.4f}, {status}")
+        rows.append(row)
+    
+    df = pd.DataFrame(rows)
+    return df
 
 
-def reset_model_state():
-    global tau, Nfeval
-    tau = 0.002
-    Nfeval = 1
-
-def run_ec_robustness(ec_values):
-    """
-    Full structural robustness to energy share.
-    Recalibrates model for each e_c.
-    """
-    global e_c, a_c
-
-    results = []
-
-    for ec_val in ec_values:
-        reset_model_state()
-        e_c = ec_val
-        a_c = 1 - b_c - e_c
-        # Recalibrate
-        theta_ec = run_calibration_loop()
-
-        # Find optimal tax
-        obj = lambda t: -welfare_at_tax(t[0], theta_ec)
-        taus = np.linspace(0.0, 0.05, 40)
-        Wvals = np.array([welfare_at_tax(t, theta_ec) for t in taus])
-        tau0 = taus[np.argmax(Wvals)]
-
-        res = minimize(
-            lambda t: -welfare_at_tax(t[0], theta_ec),
-            x0=[tau0],
-            bounds=[(0.0, 0.05)]
-        )
-        tau_star = res.x[0]
-        # Solve GE at tau*
-        set_tau(tau_star)
-        sol = solve_ge(theta_ec)
-        if not sol.success:
-            continue
-
-        x = sol.x
-        L_s = x[10]
-        K_alloc, L_alloc = get_allocations(x[:8], L_s)
-        e_vec, E, _, _ = energy_outputs(
-            K_alloc[:3], L_alloc[:3], theta_ec[4:7], theta_ec[:3]
-        )
-        Y = final_output(K_alloc[3], L_alloc[3], E, theta_ec[3])
-        Z = np.dot(phi_j, e_vec)
-
-        results.append({
-            "e_c": ec_val,
-            "tau_star": tau_star,
-            "Y": Y,
-            "E": E,
-            "Z": Z,
-            "E_Y": E / Y,
-            "Clean_share": e_vec[2] / E
-        })
-
-    return pd.DataFrame(results)
+def energy_share_sensitivity_dynamic(
+    K0: float,
+    dyn_params: DynamicParams,
+    base_static_params: Dict,
+    ec_grid: np.ndarray,
+    omega_damage: float = 0.08,
+    tau_bounds: Tuple[float, float] = (0.0, 0.30),
+    grid_n: int = 21
+) -> pd.DataFrame:
+    """Run sensitivity analysis over energy share parameter"""
+    print("\n" + "="*70)
+    print("PANEL B: ENERGY SHARE SENSITIVITY (DYNAMIC MODEL)")
+    print("="*70)
+    
+    n_cores = min(cpu_count(), len(ec_grid))
+    print(f"\nUsing {n_cores} CPU cores for parallel computation...")
+    
+    args_list = [(ec, K0, dyn_params, base_static_params, omega_damage, tau_bounds, grid_n) 
+                 for ec in ec_grid]
+    
+    with Pool(n_cores) as pool:
+        results = pool.map(_solve_ec_parallel, args_list)
+    
+    # Build DataFrame
+    rows = []
+    for ec, tau_star, status, row, new_a_c in results:
+        if row:
+            print(f"\ne_c = {ec:.3f}: τ* = {tau_star:.4f}, {status}")
+            rows.append(row)
+    
+    df = pd.DataFrame(rows)
+    return df
 
 
-MASTER_COLS = [
-    "Scenario", "Param", "Tax_%", "Y", "C", "L", "E", "Z",
-    "w", "r", "P_E", "E/Y", "K/Y", "C/Y", "Z/Y",
-    "Oil_%", "Gas_%", "Clean_%"
-]
+# ----------------------------
+# Plotting
+# ----------------------------
 
-def build_master_row(theta, tau_star, scenario, param_value):
-    set_tau(tau_star)
-    sol = solve_ge(theta)
-    if not sol.success:
-        raise RuntimeError("GE failed")
+def plot_dynamic_sensitivity(df_omega: pd.DataFrame, df_ec: pd.DataFrame):
+    """Plot sensitivity analysis results"""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle('Dynamic Model: Sensitivity Analysis', fontsize=16, fontweight='bold')
+    
+    # Panel A: Omega sensitivity
+    if 'Param' in df_omega.columns and len(df_omega) > 0:
+        axes[0, 0].plot(df_omega['Param'], df_omega['tau'], 'o-', linewidth=2)
+        axes[0, 0].set_xlabel('Damage weight ω')
+        axes[0, 0].set_ylabel('Optimal tax τ*')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        axes[0, 1].plot(df_omega['Param'], df_omega['W_PV'], 'o-', linewidth=2)
+        axes[0, 1].set_xlabel('Damage weight ω')
+        axes[0, 1].set_ylabel('Welfare (PV)')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        axes[0, 2].plot(df_omega['Param'], df_omega['Z_total'], 'o-', linewidth=2)
+        axes[0, 2].set_xlabel('Damage weight ω')
+        axes[0, 2].set_ylabel('Total emissions (PV)')
+        axes[0, 2].grid(True, alpha=0.3)
+    
+    # Panel B: Energy share sensitivity
+    if 'Param' in df_ec.columns and len(df_ec) > 0:
+        axes[1, 0].plot(df_ec['Param'], df_ec['tau'], 'o-', linewidth=2)
+        axes[1, 0].set_xlabel('Energy share e_c')
+        axes[1, 0].set_ylabel('Optimal tax τ*')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        axes[1, 1].plot(df_ec['Param'], df_ec['W_PV'], 'o-', linewidth=2)
+        axes[1, 1].set_xlabel('Energy share e_c')
+        axes[1, 1].set_ylabel('Welfare (PV)')
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        axes[1, 2].plot(df_ec['Param'], df_ec['inv_rate_avg'], 'o-', linewidth=2)
+        axes[1, 2].set_xlabel('Energy share e_c')
+        axes[1, 2].set_ylabel('Avg investment rate')
+        axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('dynamic_sensitivity.png', dpi=300, bbox_inches='tight')
+    plt.show()
 
-    x = sol.x
-    L_s = max(x[10], 1e-9)
-    r = np.exp(x[8])
-    w = np.exp(x[9])
 
-    K_alloc, L_alloc = get_allocations(x[:8], L_s)
-    K_e, K_c = K_alloc[:3], K_alloc[3]
-    L_e, L_c = L_alloc[:3], L_alloc[3]
+def print_dynamic_summary(df_omega: pd.DataFrame, df_ec: pd.DataFrame):
+    """Print summary tables"""
+    print("\n" + "="*80)
+    print("DYNAMIC MODEL: SENSITIVITY ANALYSIS SUMMARY")
+    print("="*80)
+    
+    print("\nPanel A: Damage Weight Sensitivity (ω)")
+    print("-" * 80)
+    cols_a = ['Param', 'tau', 'at_bound', 'W_PV', 'Y_avg', 'C_avg', 'Z_total', 'K_final', 'inv_rate_avg', 'success']
+    print(df_omega[cols_a].to_string(index=False))
+    
+    print("\n" + "="*80)
+    print("\nPanel B: Energy Share Sensitivity (e_c)")
+    print("-" * 80)
+    cols_b = ['Param', 'tau', 'at_bound', 'W_PV', 'Y_avg', 'C_avg', 'E_avg', 'inv_rate_avg', 'success']
+    print(df_ec[cols_b].to_string(index=False))
+    
+    print("\n" + "="*80)
 
-    e_vec, E, _, _ = energy_outputs(K_e, L_e, theta[4:7], theta[:3])
-    Y = final_output(K_c, L_c, E, theta[3])
-    Z = np.dot(phi_j, e_vec)
 
-    P_E = e_c * Y / E
-    C, _ = household_values(w, r, L_s, e_vec, theta[7])
+# ----------------------------
+# Main Analysis
+# ----------------------------
 
-    shares = e_vec / E
-
-    return {
-        "Scenario": scenario,
-        "Param": param_value,
-        "Tax_%": 100 * tau_star,
-        "Y": Y,
-        "C": C,
-        "L": L_s,
-        "E": E,
-        "Z": Z,
-        "w": w,
-        "r": r,
-        "P_E": P_E,
-        "E/Y": E / Y,
-        "K/Y": K_bar / Y,
-        "C/Y": C / Y,
-        "Z/Y": Z / Y,
-        "Oil_%": 100 * shares[0],
-        "Gas_%": 100 * shares[1],
-        "Clean_%": 100 * shares[2],
+def run_dynamic_sensitivity_analysis():
+    """Run complete sensitivity analysis"""
+    global _SOLVE_COUNTER
+    _SOLVE_COUNTER = 0
+    
+    print("\n" + "="*80)
+    print("DYNAMIC GE: OPTIMAL POLICY (WITH FULL ENERGY STRUCTURE)")
+    print("="*80)
+    
+    # Setup
+    K0 = 2.51
+    dyn_params = DynamicParams(beta=0.96, delta=0.08, T=10, K_terminal=2.51)
+    
+    base_static_params = {
+        'L_bar': 1.0,
+        'A_final': 1.0,
+        'a_c': 0.247,
+        'b_c': 0.655,
+        'e_c': 0.098,
+        'gamma': 2.0,
+        'sigma': 0.5,
+        'chi': 1.0,
+        'A_j': [5.68, 5.68, 12.5],
+        'a_j': [0.86, 0.86, 0.90],
+        'eta': 2.0,
+        'omega_E': [0.524/1.0, 0.396/1.0, 0.080/1.0],
+        'phi_j': [1.0, 0.7741, 0.0]
     }
+    
+    # Panel A: Omega sensitivity
+    omega_grid = np.array([0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.16, 0.20, 0.24, 0.30, 0.40])
+    df_omega = omega_sensitivity_dynamic(
+        K0, dyn_params, base_static_params, omega_grid,
+        tau_bounds=(0.0, 0.30), grid_n=31
+    )
+    
+    # Panel B: Energy share sensitivity
+    ec_grid = np.array([0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16])
+    df_ec = energy_share_sensitivity_dynamic(
+        K0, dyn_params, base_static_params, ec_grid,
+        omega_damage=0.08, tau_bounds=(0.0, 0.30), grid_n=31
+    )
+    
+    # Print results
+    print_dynamic_summary(df_omega, df_ec)
+    
+    # Plot
+    print("\nGenerating plots...")
+    plot_dynamic_sensitivity(df_omega, df_ec)
+    
+    # Key insights
+    print("\n" + "="*80)
+    print("KEY INSIGHTS FROM DYNAMIC MODEL")
+    print("="*80)
+    
+    if df_omega['success'].all():
+        tau_range = df_omega['tau'].max() / df_omega['tau'].min()
+        print(f"\n1. DAMAGE SENSITIVITY:")
+        print(f"   - When ω increases {omega_grid.max()/omega_grid.min():.1f}x (0.04→0.40):")
+        print(f"   - Optimal tax increases {tau_range:.2f}x")
+        print(f"   - Welfare (PV) falls from {df_omega['W_PV'].iloc[0]:.2f} to {df_omega['W_PV'].iloc[-1]:.2f}")
+        print(f"   - Emissions (PV) fall {(1-df_omega['Z_total'].iloc[-1]/df_omega['Z_total'].iloc[0])*100:.1f}%")
+        print(f"   - Average consumption falls {(1-df_omega['C_avg'].iloc[-1]/df_omega['C_avg'].iloc[0])*100:.1f}%")
+    
+    if df_ec['success'].all():
+        print(f"\n2. ENERGY SHARE SENSITIVITY:")
+        print(f"   - As e_c varies from {ec_grid.min():.2f} to {ec_grid.max():.2f}:")
+        print(f"   - Optimal tax ranges from {df_ec['tau'].min():.4f} to {df_ec['tau'].max():.4f}")
+        print(f"   - Investment rate ranges from {df_ec['inv_rate_avg'].min()*100:.1f}% to {df_ec['inv_rate_avg'].max()*100:.1f}%")
+        print(f"   - More energy-intensive economies need stronger carbon pricing")
+    
+    print("\n3. DYNAMIC vs STATIC:")
+    print("   - Dynamic model accounts for capital accumulation")
+    print("   - Investment-consumption tradeoff is explicit")
+    print("   - Welfare measured as present value over time")
+    print("   - Policy affects not just current but all future periods")
+    
+    print("\n" + "="*80)
+    
+    # Computational statistics
+    print("\n" + "="*80)
+    print("COMPUTATIONAL STATISTICS")
+    print("="*80)
+    print(f"\nTotal equilibrium solves: {_SOLVE_COUNTER:,}")
+    print(f"Parameters tested:")
+    print(f"  Panel A: {len(omega_grid)} omega values")
+    print(f"  Panel B: {len(ec_grid)} e_c values")
+    print(f"  Grid search points: 31 per optimization")
+    print(f"  Time horizon: {dyn_params.T} periods")
+    print(f"\nAverage solves per parameter: {_SOLVE_COUNTER/(len(omega_grid)+len(ec_grid)):.0f}")
+    print("="*80)
+    
+    return df_omega, df_ec
 
-
-def print_master_robustness_table(omega_grid, ec_grid):
-    global e_c, a_c
-
-    rows_A = []
-    rows_B = []
-
-    # Omega robustness 
-    e_c = 0.08
-    a_c = 1 - b_c - e_c
-    theta_base = run_calibration_loop()
-
-    for omega in omega_grid:
-        def welfare_omega(t):
-            set_tau(t)
-            sol = solve_ge(theta_base)
-            if not sol.success:
-                return -1e12
-            x = sol.x
-            L_s = max(x[10], 1e-9)
-            r = np.exp(x[8])
-            w = np.exp(x[9])
-            K_alloc, L_alloc = get_allocations(x[:8], L_s)
-            e_vec, _, _, _ = energy_outputs(
-                K_alloc[:3], L_alloc[:3], theta_base[4:7], theta_base[:3]
-            )
-            Z = np.dot(phi_j, e_vec)
-            C, _ = household_values(w, r, L_s, e_vec, theta_base[7])
-            return (
-                (C**(1 - gamma_hh)) / (1 - gamma_hh)
-                - theta_base[7] * (L_s**(1 + sigma)) / (1 + sigma)
-                - omega * Z
-            )
-
-        taus = np.linspace(0, 0.05, 40)
-        tau_star = taus[np.argmax([welfare_omega(t) for t in taus])]
-
-        rows_A.append(
-            build_master_row(theta_base, tau_star, "omega-Robustness", omega)
-        )
-
-    #  e_c robustness
-    for ec_val in ec_grid:
-        e_c = ec_val
-        a_c = 1 - b_c - e_c
-        theta_ec = run_calibration_loop()
-
-        taus = np.linspace(0, 0.05, 40)
-        tau_star = taus[np.argmax([welfare_at_tax(t, theta_ec) for t in taus])]
-
-        rows_B.append(
-            build_master_row(theta_ec, tau_star, "e_c-Robustness", ec_val)
-        )
-
-    df_A = pd.DataFrame(rows_A)[MASTER_COLS]
-    df_B = pd.DataFrame(rows_B)[MASTER_COLS]
-
-    print("\n================ ROBUSTNESS MASTER TABLE ================\n")
-    print("Panel A: Sensitivity to Climate Damages (omega)\n")
-    print(df_A.to_string(index=False))
-
-    print("\nPanel B: Sensitivity to Structural Energy Share (e_c)\n")
-    print(df_B.to_string(index=False))
-
-    return df_A, df_B
 
 if __name__ == "__main__":
-
-    print("\n================ ROBUSTNESS ANALYSIS =================")
-
-    # Baseline calibrated parameters
-    theta_base = run_calibration_loop()
-
-    #  Omega robustness
-    omega_df = run_omega_robustness(theta_base)
-    print("\nOmega Robustness Results")
-    print(omega_df)
-
-    #  e_c robustness
-    ec_grid = [0.04, 0.06, 0.08, 0.10, 0.12]
-    ec_df = run_ec_robustness(ec_grid)
-    print("\nEnergy Share Robustness Results")
-    print(ec_df)
-
-    print("\n================ END ROBUSTNESS =================")
-
-    print_master_robustness_table(
-        omega_grid=[0.04, 0.08, 0.12, 0.16, 0.40],
-        ec_grid=[0.04, 0.06, 0.08, 0.10, 0.12]
-    )
-
-    print(f"Starting baseline calibration with omega = {omega}...")
-    best_theta = run_calibration_loop()
-
-    df_baseline, df_omega, df_ec = run_robustness_analysis(best_theta)
-
-    print("\nBaseline equilibrium")
-    print(df_baseline.to_string(index=False))
-    
-    # structural output response
-    plt.figure(figsize=(8, 5))
-    plt.plot(df_ec["e_c"], df_ec["Y"], marker="o", linewidth=2.5)
-    plt.xlabel("Energy share e_c")
-    plt.ylabel("Output Y")
-    plt.tight_layout()
-    plt.show()
-
-    # robustness panels
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    ax1.plot(df_omega["omega"], df_omega["tax"], marker="s", linewidth=3)
-    ax1.set_xlabel("omega")
-    ax1.set_ylabel("optimal tax (%)")
-    ax1.grid(True, alpha=0.6)
-
-    ax2.plot(df_ec["e_c"], df_ec["tax"], marker="o", linewidth=2)
-    ax2.set_xlabel("energy share e_c")
-    ax2.set_ylabel("optimal tax (%)")
-    ax2.grid(True, alpha=0.6)
-
-    plt.tight_layout()
-    plt.show()
+    df_omega, df_ec = run_dynamic_sensitivity_analysis()
