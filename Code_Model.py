@@ -133,11 +133,8 @@ class Equilibrium:
     max_abs_resid: float
     damage_factor: float = 1.0
 
-
 # ----------------------------
 # Production Functions
-# ----------------------------
-
 def energy_output(K: float, L: float, A: float, a: float) -> float:
     """Energy sector output: E_j = A_j * K_j^{a_j} * L_j^{1-a_j}"""
     K = _clamp_pos(K)
@@ -198,8 +195,6 @@ def final_output(K: float, L: float, E: float, A: float, a: float, b: float, e: 
 
 # ----------------------------
 # Utility and Emissions
-# ----------------------------
-
 def emissions(Ej: np.ndarray, phi_j: np.ndarray) -> float:
     """Total emissions: Z = sum phi_j * E_j"""
     Ej = np.asarray(Ej, dtype=float)
@@ -241,8 +236,6 @@ def household_labour_foc(w: float, C: float, pref: Preferences, L: float) -> flo
 
 # ----------------------------
 # Equilibrium Solver
-# ----------------------------
-
 def _implied_component_prices_from_ces(Ej: np.ndarray, E: float, pE: float, eta: float, omega: np.ndarray) -> np.ndarray:
     """Back out component prices from CES structure"""
     Ej = np.asarray(Ej, dtype=float)
@@ -381,8 +374,6 @@ def solve_equilibrium(P, pref: Preferences, pol: Policy, x0: Optional[np.ndarray
 
 # ----------------------------
 # Dynamic Model Components
-# ----------------------------
-
 @dataclass
 class DynamicParams:
     """Parameters for dynamic model"""
@@ -422,8 +413,6 @@ class DynamicEquilibrium:
 
 # ----------------------------
 # Dynamic Equilibrium Solver
-# ----------------------------
-
 def solve_dynamic_equilibrium_simple(
     K0: float,
     dyn_params: DynamicParams,
@@ -633,8 +622,6 @@ def solve_dynamic_equilibrium_simple(
 
 # ----------------------------
 # Parallel Helper Functions
-# ----------------------------
-
 def _evaluate_tau_parallel(args):
     """Helper for parallel grid search"""
     tau, K0, dyn_params, static_params, omega_damage = args
@@ -703,8 +690,6 @@ def _solve_ec_parallel(args):
 
 # ----------------------------
 # Optimal Tax Finding
-# ----------------------------
-
 def find_optimal_tau_dynamic(
     K0: float,
     dyn_params: DynamicParams,
@@ -777,8 +762,6 @@ def find_optimal_tau_dynamic(
 
 # ----------------------------
 # Sensitivity Analysis
-# ----------------------------
-
 def summarize_dynamic_eq(eq: Optional[DynamicEquilibrium], tau: float, omega: float, 
                         param_type: str, param_value: float) -> Dict:
     """Summarize dynamic equilibrium for table output"""
@@ -886,8 +869,6 @@ def energy_share_sensitivity_dynamic(
 
 # ----------------------------
 # Plotting
-# ----------------------------
-
 def plot_dynamic_sensitivity(df_omega: pd.DataFrame, df_ec: pd.DataFrame):
     """Plot sensitivity analysis results"""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -954,8 +935,6 @@ def print_dynamic_summary(df_omega: pd.DataFrame, df_ec: pd.DataFrame):
 
 # ----------------------------
 # Main Analysis
-# ----------------------------
-
 def run_dynamic_sensitivity_analysis():
     """Run complete sensitivity analysis"""
     global _SOLVE_COUNTER
